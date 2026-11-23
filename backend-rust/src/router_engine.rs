@@ -695,7 +695,7 @@ async fn execute_antigravity_candidate(
                 let mut collected = AntigravityCollected::default();
                 let chunk_id = format!("chatcmpl-{}", Uuid::new_v4());
                 let created = Utc::now().timestamp();
-                let mut sent_role = false;
+                let mut sent_start = false;
                 let mut ttft_ms: Option<i64> = None;
 
                 while let Some(item) = byte_stream.next().await {
@@ -718,25 +718,17 @@ async fn execute_antigravity_candidate(
                             if ttft_ms.is_none() {
                                 ttft_ms = Some(started.elapsed().as_millis() as i64);
                             }
-                            if !sent_role {
-                                sent_role = true;
-                                if let Some(obj) = delta.as_object_mut() {
-                                    obj.insert("role".to_string(), json!("assistant"));
-                                }
-                            }
-                            let sse_chunk = json!({
-                                "id": chunk_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": req_model_cl,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": delta,
-                                    "finish_reason": null,
-                                }]
-                            });
-                            let formatted = format!("data: {}\n\n", sse_chunk);
-                            if tx.send(Ok(Bytes::from(formatted))).await.is_err() {
+                            let formatted = format_client_sse_delta(
+                                client_format,
+                                &chunk_id,
+                                created,
+                                &req_model_cl,
+                                &mut delta,
+                                &mut sent_start,
+                            );
+                            if !formatted.is_empty()
+                                && tx.send(Ok(Bytes::from(formatted))).await.is_err()
+                            {
                                 return;
                             }
                         }
@@ -750,28 +742,18 @@ async fn execute_antigravity_candidate(
                 } else {
                     collected.finish_reason.as_str()
                 };
-                let final_chunk = json!({
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": req_model_cl,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": finish_reason,
-                    }],
-                    "usage": {
-                        "prompt_tokens": collected.prompt_tokens,
-                        "completion_tokens": collected.completion_tokens,
-                        "total_tokens": collected.total_tokens,
-                    }
-                });
-                let _ = tx
-                    .send(Ok(Bytes::from(format!(
-                        "data: {}\n\ndata: [DONE]\n\n",
-                        final_chunk
-                    ))))
-                    .await;
+                let final_sse = format_client_sse_finish(
+                    client_format,
+                    &chunk_id,
+                    created,
+                    &req_model_cl,
+                    finish_reason,
+                    &collected.text_content,
+                    collected.prompt_tokens,
+                    collected.completion_tokens,
+                    sent_start,
+                );
+                let _ = tx.send(Ok(Bytes::from(final_sse))).await;
 
                 state_cl
                     .db
@@ -1026,6 +1008,10 @@ async fn execute_openai_compatible_candidate(
         let mut tokens_in = 0i64;
         let mut tokens_out = 0i64;
         let mut line_buf = String::new();
+        let mut acc_text = String::new();
+        let mut sent_start = false;
+        let chunk_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let created = Utc::now().timestamp();
 
         while let Some(item) = byte_stream.next().await {
             let Ok(chunk) = item else { break };
@@ -1049,12 +1035,55 @@ async fn execute_openai_compatible_candidate(
                                 .and_then(Value::as_i64)
                                 .unwrap_or(tokens_out);
                         }
+                        if client_format != ClientResponseFormat::OpenAIChat {
+                            if let Some(mut delta) = v
+                                .get("choices")
+                                .and_then(Value::as_array)
+                                .and_then(|a| a.first())
+                                .and_then(|c| c.get("delta"))
+                                .cloned()
+                            {
+                                if let Some(txt) = delta.get("content").and_then(Value::as_str) {
+                                    acc_text.push_str(txt);
+                                }
+                                let formatted = format_client_sse_delta(
+                                    client_format,
+                                    &chunk_id,
+                                    created,
+                                    &req_model_cl,
+                                    &mut delta,
+                                    &mut sent_start,
+                                );
+                                if !formatted.is_empty()
+                                    && tx.send(Ok(Bytes::from(formatted))).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             }
-            if tx.send(Ok(chunk)).await.is_err() {
+            if client_format == ClientResponseFormat::OpenAIChat
+                && tx.send(Ok(chunk)).await.is_err()
+            {
                 return;
             }
+        }
+
+        if client_format != ClientResponseFormat::OpenAIChat {
+            let final_sse = format_client_sse_finish(
+                client_format,
+                &chunk_id,
+                created,
+                &req_model_cl,
+                "stop",
+                &acc_text,
+                tokens_in,
+                tokens_out,
+                sent_start,
+            );
+            let _ = tx.send(Ok(Bytes::from(final_sse))).await;
         }
 
         state_cl
@@ -1170,4 +1199,201 @@ fn collect_openai_sse_into_completion(raw_sse: &str, requested_model: &str) -> V
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
+}
+
+fn format_client_sse_delta(
+    client_format: ClientResponseFormat,
+    chunk_id: &str,
+    created: i64,
+    model: &str,
+    delta: &mut Value,
+    sent_start: &mut bool,
+) -> String {
+    match client_format {
+        ClientResponseFormat::OpenAIChat => {
+            if !*sent_start {
+                *sent_start = true;
+                if let Some(obj) = delta.as_object_mut() {
+                    obj.insert("role".to_string(), json!("assistant"));
+                }
+            }
+            let sse_chunk = json!({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": null,
+                }]
+            });
+            format!("data: {}\n\n", sse_chunk)
+        }
+        ClientResponseFormat::AnthropicMessages => {
+            let mut out = String::new();
+            if !*sent_start {
+                *sent_start = true;
+                let msg_start = json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": format!("msg_{}", Uuid::new_v4().simple()),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                    }
+                });
+                let block_start = json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                });
+                out.push_str(&format!(
+                    "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
+                    msg_start, block_start
+                ));
+            }
+            if let Some(txt) = delta.get("content").and_then(Value::as_str) {
+                if !txt.is_empty() {
+                    let block_delta = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": txt }
+                    });
+                    out.push_str(&format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        block_delta
+                    ));
+                }
+            }
+            out
+        }
+        ClientResponseFormat::OpenAIResponses => {
+            let mut out = String::new();
+            if !*sent_start {
+                *sent_start = true;
+                let created_ev = json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": format!("resp_{}", Uuid::new_v4().simple()),
+                        "object": "response",
+                        "created_at": created,
+                        "status": "in_progress",
+                        "model": model,
+                        "output": []
+                    }
+                });
+                out.push_str(&format!(
+                    "event: response.created\ndata: {}\n\n",
+                    created_ev
+                ));
+            }
+            if let Some(txt) = delta.get("content").and_then(Value::as_str) {
+                if !txt.is_empty() {
+                    let delta_ev = json!({
+                        "type": "response.output_text.delta",
+                        "delta": txt,
+                    });
+                    out.push_str(&format!(
+                        "event: response.output_text.delta\ndata: {}\n\n",
+                        delta_ev
+                    ));
+                }
+            }
+            out
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_client_sse_finish(
+    client_format: ClientResponseFormat,
+    chunk_id: &str,
+    created: i64,
+    model: &str,
+    finish_reason: &str,
+    full_text: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    sent_start: bool,
+) -> String {
+    match client_format {
+        ClientResponseFormat::OpenAIChat => {
+            let final_chunk = json!({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+            });
+            format!("data: {}\n\ndata: [DONE]\n\n", final_chunk)
+        }
+        ClientResponseFormat::AnthropicMessages => {
+            let mut out = String::new();
+            if !sent_start {
+                let mut dummy = json!({});
+                let mut s = false;
+                out.push_str(&format_client_sse_delta(
+                    client_format,
+                    chunk_id,
+                    created,
+                    model,
+                    &mut dummy,
+                    &mut s,
+                ));
+            }
+            let stop_reason = match finish_reason {
+                "tool_calls" => "tool_use",
+                "length" => "max_tokens",
+                _ => "end_turn",
+            };
+            let block_stop = json!({ "type": "content_block_stop", "index": 0 });
+            let msg_delta = json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                "usage": { "input_tokens": prompt_tokens, "output_tokens": completion_tokens }
+            });
+            let msg_stop = json!({ "type": "message_stop" });
+            out.push_str(&format!(
+                "event: content_block_stop\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                block_stop, msg_delta, msg_stop
+            ));
+            out
+        }
+        ClientResponseFormat::OpenAIResponses => {
+            let completed_ev = json!({
+                "type": "response.completed",
+                "response": {
+                    "id": format!("resp_{}", Uuid::new_v4().simple()),
+                    "object": "response",
+                    "created_at": created,
+                    "status": "completed",
+                    "model": model,
+                    "output_text": full_text,
+                    "usage": {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    }
+                }
+            });
+            format!(
+                "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+                completed_ev
+            )
+        }
+    }
 }

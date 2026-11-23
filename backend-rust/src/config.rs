@@ -164,6 +164,23 @@ impl AppConfig {
                     println!("{}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
+                "--help" | "-h" => {
+                    println!(
+                        "OmniRoute Rust Gateway v{}\n\n\
+                         Usage: omniroute-rust [OPTIONS]\n\n\
+                         Options:\n  \
+                           -p, --port <PORT>              Port to listen on (default: 20129, env: PORT)\n  \
+                           -H, --host <HOST>              Host to bind to (default: 0.0.0.0, env: HOST)\n      \
+                           --data-dir <DIR>           Data directory containing storage.sqlite and .env (env: DATA_DIR)\n      \
+                           --next-upstream <URL>      Optional Next.js dashboard upstream URL (env: NEXT_UPSTREAM_URL)\n      \
+                           --no-open                  Do not open browser on startup (accepted for CLI compatibility)\n  \
+                           -v, --version                  Print version information\n  \
+                           -h, --help                     Print this help message",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    std::process::exit(0);
+                }
+                "--no-open" => {}
                 _ => {
                     if let Some(p) = arg.strip_prefix("--port=") {
                         cli_port = p.parse::<u16>().ok();
@@ -177,6 +194,7 @@ impl AppConfig {
         }
 
         let data_dir = cli_data_dir.unwrap_or_else(default_data_dir);
+        let _ = fs::create_dir_all(&data_dir);
         let mut file_vars: HashMap<String, String> = HashMap::new();
         let mut before_fix_key: Option<String> = None;
 
@@ -213,7 +231,9 @@ impl AppConfig {
             .or_else(|| get_var("HOST"))
             .unwrap_or_else(|| "0.0.0.0".to_string());
 
-        let storage_encryption_key = get_var("STORAGE_ENCRYPTION_KEY");
+        let storage_encryption_key = get_var("STORAGE_ENCRYPTION_KEY").or_else(|| {
+            Some(ensure_or_generate_storage_encryption_key(&data_dir))
+        });
         let storage_encryption_key_before_fix = match (&storage_encryption_key, before_fix_key) {
             (Some(curr), Some(bf)) if bf.trim() != curr.trim() && !bf.trim().is_empty() => Some(bf),
             _ => None,
@@ -266,4 +286,29 @@ fn read_env_file(path: &Path) -> Option<(HashMap<String, String>, Option<String>
         }
     }
     Some((map, before_fix))
+}
+
+fn ensure_or_generate_storage_encryption_key(data_dir: &Path) -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    let generated = hex::encode(bytes);
+    let env_path = data_dir.join(".env");
+    let line = format!("STORAGE_ENCRYPTION_KEY={}\n", generated);
+    if env_path.exists() {
+        if let Ok(mut existing) = fs::read_to_string(&env_path) {
+            if !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(&line);
+            let _ = fs::write(&env_path, existing);
+        }
+    } else {
+        let _ = fs::write(&env_path, line);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600));
+    }
+    generated
 }

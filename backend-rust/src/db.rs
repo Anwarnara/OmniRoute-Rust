@@ -256,6 +256,7 @@ impl DbStore {
         }
         let store = Self { db_path, crypto };
         store.ensure_base_schema()?;
+        store.ensure_bootstrap_state()?;
         Ok(store)
     }
 
@@ -405,8 +406,89 @@ impl DbStore {
                 allow_cc_discovery_aliases INTEGER DEFAULT 1,
                 catalog_scope TEXT DEFAULT 'all',
                 forced_model TEXT
+            );
+            CREATE TABLE IF NOT EXISTS call_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                method TEXT,
+                path TEXT,
+                status INTEGER,
+                model TEXT,
+                requested_model TEXT,
+                provider TEXT,
+                account TEXT,
+                connection_id TEXT,
+                duration INTEGER DEFAULT 0,
+                ttft_ms INTEGER,
+                tokens_in INTEGER DEFAULT 0,
+                tokens_out INTEGER DEFAULT 0,
+                tokens_reasoning INTEGER DEFAULT 0,
+                tokens_cache_read INTEGER DEFAULT 0,
+                request_type TEXT,
+                source_format TEXT,
+                target_format TEXT,
+                api_key_id TEXT,
+                api_key_name TEXT,
+                combo_name TEXT,
+                error_summary TEXT,
+                correlation_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS usage_history (
+                id TEXT PRIMARY KEY,
+                provider TEXT,
+                model TEXT,
+                connection_id TEXT,
+                api_key_id TEXT,
+                api_key_name TEXT,
+                tokens_input INTEGER DEFAULT 0,
+                tokens_output INTEGER DEFAULT 0,
+                tokens_cache_read INTEGER DEFAULT 0,
+                tokens_reasoning INTEGER DEFAULT 0,
+                status TEXT,
+                success INTEGER DEFAULT 1,
+                latency_ms INTEGER DEFAULT 0,
+                ttft_ms INTEGER,
+                timestamp TEXT NOT NULL,
+                endpoint TEXT
             );",
         )?;
+        Ok(())
+    }
+
+    fn ensure_bootstrap_state(&self) -> Result<()> {
+        for secret_key in ["jwtSecret", "apiKeySecret"] {
+            if self.get_persisted_secret(secret_key).is_none() {
+                let mut bytes = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+                let generated = hex::encode(bytes);
+                let enc = self.crypto.encrypt(&generated);
+                let _ = self.set_kv_json("secrets", secret_key, &json!(enc));
+            }
+        }
+
+        let conn = self.conn()?;
+        let key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap_or(0);
+        if key_count == 0 {
+            if let Ok((_, raw_key)) = self.create_api_key(&json!({
+                "name": "Default Key",
+                "scopes": ["*"]
+            })) {
+                if let Some(parent) = self.db_path.parent() {
+                    let key_file = parent.join("initial_api_key.txt");
+                    let _ = std::fs::write(&key_file, format!("{}\n", raw_key));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &key_file,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
